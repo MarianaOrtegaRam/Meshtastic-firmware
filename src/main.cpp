@@ -1596,6 +1596,9 @@ void loop()
 #endif
 
     service->loop();
+#if !MESHTASTIC_EXCLUDE_INPUTBROKER && defined(HAS_FREE_RTOS)
+    inputBroker->processInputEventQueue();
+#endif
 #if defined(LGFX_SDL)
     if (screen) {
         auto dispdev = screen->getDisplayDevice();

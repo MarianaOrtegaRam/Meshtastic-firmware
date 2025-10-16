@@ -130,7 +130,12 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
 
     // Append 4-byte extraNonce (little-endian) after ciphertext+tag
     memcpy(bytesOut + ctlen, &extraNonceTmp, sizeof(extraNonceTmp));
-    // final on-wire length is ctlen + 4
+    size_t out_len = ctlen + sizeof(extraNonceTmp);
+
+    // LOG: confirm ASCON was used and the output length (useful to check on-wire size)
+    LOG_INFO("encryptCurve25519: used ASCON AEAD, plaintext=%u -> encrypted_onwire=%u (tag+extraNonce=%u)",
+             (unsigned)numBytes, (unsigned)out_len, (unsigned)(ASCON_TAGLEN + sizeof(uint32_t)));
+
     return true;
 #else
     // Legacy AES-CCM path (keeps old behavior)
@@ -141,6 +146,12 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
     // write auth (8 bytes tag + 4 bytes extraNonce)
     memcpy(bytesOut + numBytes, auth, 12);
     memcpy(bytesOut + numBytes + 8, &extraNonceTmp, sizeof(extraNonceTmp));
+    size_t out_len = numBytes + 12;
+
+    // LOG: confirm AES-CCM legacy was used and the output length
+    LOG_INFO("encryptCurve25519: used AES-CCM PKI (legacy), plaintext=%u -> encrypted_onwire=%u (overhead=%u)",
+             (unsigned)numBytes, (unsigned)out_len, (unsigned)12);
+
     return true;
 #endif
 }
@@ -189,7 +200,7 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_UserLite_publ
     uint8_t ascon_key[ASCON_KEYLEN];
     ascon_key_from_shared_truncate(shared_key, ascon_key);
 
-    // Rebuild nonce
+    // Rebuild nonce (uses extraNonce extracted)
     initNonce(fromNode, packetNum, extraNonce);
 
     // Decrypt in-place: ascon_decrypt reads ct (ctlen) and writes plaintext into bytesOut
@@ -199,7 +210,11 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_UserLite_publ
         LOG_WARN("ASCON decrypt attempted but failed (code %d)", r);
         return false;
     }
-    // success
+
+    // LOG: confirm ASCON decrypt success and plaintext length
+    LOG_INFO("decryptCurve25519: used ASCON AEAD, decrypted_plaintext=%u (ct_onwire=%u, extraNonce=%u)",
+             (unsigned)ptlen, (unsigned)ctlen, (unsigned)extraNonce);
+
     return true;
 #else
     // Legacy AES-CCM path
@@ -223,6 +238,11 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_UserLite_publ
         LOG_WARN("PKC decrypt attempted but failed!");
         return false;
     }
+
+    // LOG: confirm legacy AES-CCM decrypt success
+    LOG_INFO("decryptCurve25519: used AES-CCM PKI (legacy), decrypted_plaintext=%u (ct_onwire=%u, extraNonce=%u)",
+             (unsigned)(ciphertext_len - 8), (unsigned)ciphertext_len, (unsigned)extraNonce);
+
     return true;
 #endif
 }

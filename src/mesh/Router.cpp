@@ -23,6 +23,39 @@
 #include "serialization/MeshPacketSerializer.h"
 #endif
 
+// ---------------------------------------------------------------------------
+// Notes about AEAD overhead and changes introduced for ASCON
+//
+// We introduce a compile-time switch (ENABLE_ASCON) that, when enabled,
+// changes the PKI (Curve25519) encryption wire format to use ASCON AEAD.
+// Important consequence: wire-format overhead for PKI/Curve25519 packets
+// changes from the original 12 bytes to 20 bytes (16-byte ASCON tag + 4-byte
+// extraNonce appended).
+//
+// To avoid hardcoding the old 12 everywhere and to keep a clear audit trail,
+// we branch on ENABLE_ASCON in three critical places:
+//
+//  * deciding if an incoming encrypted packet is even long enough to be a PKI
+//    encrypted packet (threshold check before attempting PKI decryption);
+//  * after successful PKI decrypt, subtracting the correct overhead to obtain
+//    the plaintext length used for protobuf decode;
+//  * when preparing a PKI encrypted packet for transmit, ensuring we check the
+//    MTU with the proper overhead and update numbytes with the proper overhead.
+//
+// The changes are deliberately small and isolated so the rest of the router
+// logic remains unchanged when ASCON is disabled.
+//
+// ---------------------------------------------------------------------------
+
+#ifdef ENABLE_ASCON
+// New AEAD overhead used when ASCON AEAD is active:
+//  - 16 bytes: ASCON authentication tag
+//  -  4 bytes: extraNonce appended on-wire (preserves prior nonce semantics)
+#ifndef MESHTASTIC_AEAD_OVERHEAD
+#define MESHTASTIC_AEAD_OVERHEAD 20
+#endif
+#endif
+
 #define MAX_RX_FROMRADIO                                                                                                         \
     4 // max number of packets destined to our queue, we dispatch packets quickly so it doesn't need to be big
 
@@ -421,9 +454,19 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
     ChannelIndex chIndex = 0;
 #if !(MESHTASTIC_EXCLUDE_PKI)
     // Attempt PKI decryption first
+    //
+    // IMPORTANT: When ASCON is enabled the on-wire PKI overhead changed from 12 bytes
+    // to MESHTASTIC_AEAD_OVERHEAD (20 bytes). Therefore we must only attempt PKI
+    // decryption if the received buffer is bigger than the chosen overhead.
+#ifdef ENABLE_ASCON
+    if (p->channel == 0 && isToUs(p) && p->to > 0 && !isBroadcast(p->to) && nodeDB->getMeshNode(p->from) != nullptr &&
+        nodeDB->getMeshNode(p->from)->user.public_key.size > 0 && nodeDB->getMeshNode(p->to)->user.public_key.size > 0 &&
+        rawSize > MESHTASTIC_AEAD_OVERHEAD) {
+#else
     if (p->channel == 0 && isToUs(p) && p->to > 0 && !isBroadcast(p->to) && nodeDB->getMeshNode(p->from) != nullptr &&
         nodeDB->getMeshNode(p->from)->user.public_key.size > 0 && nodeDB->getMeshNode(p->to)->user.public_key.size > 0 &&
         rawSize > MESHTASTIC_PKC_OVERHEAD) {
+#endif
         LOG_DEBUG("Attempt PKI decryption");
 
         if (crypto->decryptCurve25519(p->from, nodeDB->getMeshNode(p->from)->user.public_key, p->id, rawSize, p->encrypted.bytes,
@@ -432,7 +475,12 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
 
             meshtastic_Data decodedtmp;
             memset(&decodedtmp, 0, sizeof(decodedtmp));
-            rawSize -= MESHTASTIC_PKC_OVERHEAD;
+            // Subtract the correct overhead to obtain plaintext length for protobuf decode.
+#ifdef ENABLE_ASCON
+            rawSize -= MESHTASTIC_AEAD_OVERHEAD; // ASCON tag + extraNonce
+#else
+            rawSize -= MESHTASTIC_PKC_OVERHEAD; // original PKC overhead (12)
+#endif
             if (pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp) &&
                 decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
                 decrypted = true;
@@ -636,8 +684,14 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
             p->decoded.portnum != meshtastic_PortNum_TRACEROUTE_APP && p->decoded.portnum != meshtastic_PortNum_NODEINFO_APP &&
             p->decoded.portnum != meshtastic_PortNum_ROUTING_APP && p->decoded.portnum != meshtastic_PortNum_POSITION_APP) {
             LOG_DEBUG("Use PKI!");
+            // When checking the transmit MTU we must include the correct PKI overhead.
+#ifdef ENABLE_ASCON
+            if (numbytes + MESHTASTIC_HEADER_LENGTH + MESHTASTIC_AEAD_OVERHEAD > MAX_LORA_PAYLOAD_LEN)
+                return meshtastic_Routing_Error_TOO_LARGE;
+#else
             if (numbytes + MESHTASTIC_HEADER_LENGTH + MESHTASTIC_PKC_OVERHEAD > MAX_LORA_PAYLOAD_LEN)
                 return meshtastic_Routing_Error_TOO_LARGE;
+#endif
             if (p->pki_encrypted && !memfll(p->public_key.bytes, 0, 32) &&
                 memcmp(p->public_key.bytes, node->user.public_key.bytes, 32) != 0) {
                 LOG_WARN("Client public key differs from requested: 0x%02x, stored key begins 0x%02x", *p->public_key.bytes,
@@ -645,7 +699,12 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
                 return meshtastic_Routing_Error_PKI_FAILED;
             }
             crypto->encryptCurve25519(p->to, getFrom(p), node->user.public_key, p->id, numbytes, bytes, p->encrypted.bytes);
-            numbytes += MESHTASTIC_PKC_OVERHEAD;
+            // After encrypting the plaintext we must increase numbytes to reflect the on-wire size
+#ifdef ENABLE_ASCON
+            numbytes += MESHTASTIC_AEAD_OVERHEAD; // ciphertext includes ASCON tag + appended extraNonce
+#else
+            numbytes += MESHTASTIC_PKC_OVERHEAD; // previous behavior: add 12-byte overhead
+#endif
             p->channel = 0;
             p->pki_encrypted = true;
         } else {

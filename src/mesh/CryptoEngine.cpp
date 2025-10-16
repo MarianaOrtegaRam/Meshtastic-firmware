@@ -14,7 +14,7 @@
 #ifdef ENABLE_ASCON
 // Include your ASCON wrapper in C linkage so we can call it from C++
 extern "C" {
-  #include "ascon_wrapper.h"
+  #include "ascon/ascon_wrapper.h"
 }
 #endif
 
@@ -98,71 +98,49 @@ void CryptoEngine::clearKeys()
 bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtastic_UserLite_public_key_t remotePublic,
                                      uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut)
 {
-    uint8_t *auth;
-    long extraNonceTmp = random();
-    auth = bytesOut + numBytes;
-    memcpy((uint8_t *)(auth + 8), &extraNonceTmp,
-           sizeof(uint32_t)); // do not use dereference on potential non aligned pointers : *extraNonce = extraNonceTmp;
-    LOG_DEBUG("Random nonce value: %d", extraNonceTmp);
+    uint32_t extraNonceTmp = (uint32_t)random();
+
     if (remotePublic.size == 0) {
         LOG_DEBUG("Node %d or their public_key not found", toNode);
         return false;
     }
+
+    // Compute DH shared secret into shared_key
     if (!crypto->setDHPublicKey(remotePublic.bytes)) {
         return false;
     }
+    // Hash the shared secret into shared_key (32 bytes) - same as existing code flow
     crypto->hash(shared_key, 32);
+
+    // Build nonce: packetNum (8) | fromNode (4) | extraNonce (4)
     initNonce(fromNode, packetNum, extraNonceTmp);
 
-    // Print debug info (existing behavior retained)
-    printBytes("Attempt encrypt with nonce: ", nonce, 13);
-    printBytes("Attempt encrypt with shared_key starting with: ", shared_key, 8);
-
 #ifdef ENABLE_ASCON
-    // ---------------------------
-    // ASCON AEAD path
-    // ---------------------------
-    // Derive a 128-bit ASCON key by truncating the 32-byte shared_key.
-    uint8_t ascon_key[16];
-    memcpy(ascon_key, shared_key, 16);
+    // Derive 16-byte key for ASCON (wrapper helper)
+    uint8_t ascon_key[ASCON_KEYLEN];
+    ascon_key_from_shared_truncate(shared_key, ascon_key);
 
-    // Build a 128-bit ASCON nonce. We choose a layout that includes
-    // packetNum (8 bytes), fromNode (4 bytes), extraNonceTmp (4 bytes).
-    // Ensure both sender and receiver build the nonce exactly the same.
-    uint8_t ascon_nonce[16];
-    memset(ascon_nonce, 0, sizeof(ascon_nonce));
-    memcpy(ascon_nonce + 0, &packetNum, sizeof(packetNum));   // 8 bytes
-    memcpy(ascon_nonce + 8, &fromNode, sizeof(fromNode));     // 4 bytes
-    memcpy(ascon_nonce + 12, &extraNonceTmp, sizeof(uint32_t)); // 4 bytes
-
-    // No AAD used here (nullptr,0) – if you need header AAD, set it accordingly.
+    // Encrypt: write ciphertext+tag directly into bytesOut
     size_t ctlen = 0;
-    int rc = ascon_encrypt(ascon_key, ascon_nonce,
-                           nullptr, 0,
-                           bytes, numBytes,
-                           bytesOut, &ctlen);
-    if (rc != 0) {
-        LOG_ERROR("ASCON encrypt failed rc=%d", rc);
+    int r = ascon_encrypt(ascon_key, nonce, nullptr, 0, bytes, numBytes, bytesOut, &ctlen);
+    if (r != 0) {
+        LOG_WARN("ASCON encrypt failed (code %d)", r);
         return false;
     }
 
-    // Append extraNonce (4 bytes) after the ciphertext+tag so the receiver
-    // can reconstruct the nonce before decrypting.
-    uint8_t *extraPtr = bytesOut + ctlen;
-    memcpy(extraPtr, &extraNonceTmp, sizeof(uint32_t));
-
-    // Note: the final on-wire encoded length = ctlen + 4
-    // (ctlen already includes ASCON tag length).
+    // Append 4-byte extraNonce (little-endian) after ciphertext+tag
+    memcpy(bytesOut + ctlen, &extraNonceTmp, sizeof(extraNonceTmp));
+    // final on-wire length is ctlen + 4
     return true;
 #else
-    // ---------------------------
-    // Original AES-CCM path (fallback)
-    // ---------------------------
-    // Keep the old AES-CCM behavior if ASCON is disabled.
-    aes_ccm_ae(shared_key, 32, nonce, 8, bytes, numBytes, nullptr, 0, bytesOut,
-               auth); // this can write up to 15 bytes longer than numbytes past bytesOut
-    memcpy((uint8_t *)(auth + 8), &extraNonceTmp,
-           sizeof(uint32_t)); // do not use dereference on potential non aligned pointers : *extraNonce = extraNonceTmp;
+    // Legacy AES-CCM path (keeps old behavior)
+    uint8_t auth[12]; // previous code used 12 bytes total: 8 tag + 4 extraNonce
+    // copy plaintext into bytesOut
+    memcpy(bytesOut, bytes, numBytes);
+    aes_ccm_ae(shared_key, 32, nonce, 8, bytesOut, numBytes, nullptr, 0, bytesOut, auth);
+    // write auth (8 bytes tag + 4 bytes extraNonce)
+    memcpy(bytesOut + numBytes, auth, 12);
+    memcpy(bytesOut + numBytes + 8, &extraNonceTmp, sizeof(extraNonceTmp));
     return true;
 #endif
 }
@@ -186,85 +164,69 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
 bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_UserLite_public_key_t remotePublic, uint64_t packetNum,
                                      size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut)
 {
-#ifdef ENABLE_ASCON
-    // ---------------------------
-    // ASCON AEAD path (new)
-    // ---------------------------
     if (remotePublic.size == 0) {
         LOG_DEBUG("Node or its public key not found in database");
         return false;
     }
 
-    // Wire layout check: we must have at least [tag(16) + extraNonce(4)]
-    if (numBytes < (size_t)(16 + 4)) {
-        LOG_ERROR("Encrypted packet too short for ASCON layout");
+#ifdef ENABLE_ASCON
+    // Need at least tag + extraNonce
+    if (numBytes < (ASCON_TAGLEN + sizeof(uint32_t))) {
+        LOG_WARN("ASCON PKI packet too small (%zu)", numBytes);
         return false;
     }
-
-    // Extract extraNonce from the end (last 4 bytes)
+    // Extract extraNonce (last 4 bytes)
     uint32_t extraNonce = 0;
-    memcpy(&extraNonce, bytes + numBytes - 4, sizeof(uint32_t));
-    LOG_INFO("Random nonce value (from wire): %u", extraNonce);
+    memcpy(&extraNonce, bytes + numBytes - sizeof(uint32_t), sizeof(uint32_t));
+    // ciphertext+tag length
+    size_t ctlen = numBytes - sizeof(uint32_t);
 
-    // Compute shared secret (setDHPublicKey) and hash it (as original code did)
+    // Derive shared key and ASCON key
     if (!crypto->setDHPublicKey(remotePublic.bytes)) {
         return false;
     }
     crypto->hash(shared_key, 32);
+    uint8_t ascon_key[ASCON_KEYLEN];
+    ascon_key_from_shared_truncate(shared_key, ascon_key);
 
-    // Reconstruct ASCON nonce: must match the sender's construction
-    uint8_t ascon_nonce[16];
-    memset(ascon_nonce, 0, sizeof(ascon_nonce));
-    memcpy(ascon_nonce + 0, &packetNum, sizeof(packetNum));   // 8 bytes
-    memcpy(ascon_nonce + 8, &fromNode, sizeof(fromNode));     // 4 bytes
-    memcpy(ascon_nonce + 12, &extraNonce, sizeof(uint32_t));  // 4 bytes
+    // Rebuild nonce
+    initNonce(fromNode, packetNum, extraNonce);
 
-    // Truncate shared_key to get 128-bit ASCON key (same as sender)
-    uint8_t ascon_key[16];
-    memcpy(ascon_key, shared_key, 16);
-
-    // Ciphertext+tag is everything except the final 4 bytes (extraNonce)
-    size_t ct_and_tag_len = numBytes - 4;
-
+    // Decrypt in-place: ascon_decrypt reads ct (ctlen) and writes plaintext into bytesOut
     size_t ptlen = 0;
-    int rc = ascon_decrypt(ascon_key, ascon_nonce,
-                           nullptr, 0,
-                           bytes, ct_and_tag_len,
-                           bytesOut, &ptlen);
-    if (rc != 0) {
-        LOG_WARN("ASCON decrypt failed (MAC or other): rc=%d", rc);
+    int r = ascon_decrypt(ascon_key, nonce, nullptr, 0, bytes, ctlen, bytesOut, &ptlen);
+    if (r != 0) {
+        LOG_WARN("ASCON decrypt attempted but failed (code %d)", r);
         return false;
     }
-
-    // Successful decrypt: bytesOut contains ptlen bytes of plaintext.
+    // success
     return true;
 #else
-    // ---------------------------
-    // Original AES-CCM path (fallback)
-    // ---------------------------
-    const uint8_t *auth = bytes + numBytes - 12; // set to last 8 bytes of text?
-    uint32_t extraNonce;                         // pointer was not really used
-    memcpy(&extraNonce, auth + 8,
-           sizeof(uint32_t)); // do not use dereference on potential non aligned pointers : (uint32_t *)(auth + 8);
-    LOG_INFO("Random nonce value: %d", extraNonce);
-
-    if (remotePublic.size == 0) {
-        LOG_DEBUG("Node or its public key not found in database");
+    // Legacy AES-CCM path
+    if (numBytes < MESHTASTIC_PKC_OVERHEAD) {
+        LOG_WARN("Legacy PKI packet too small (%zu)", numBytes);
         return false;
     }
+    const uint8_t *auth = bytes + numBytes - MESHTASTIC_PKC_OVERHEAD;
+    uint32_t extraNonce = 0;
+    memcpy(&extraNonce, auth + 8, sizeof(uint32_t));
+    size_t ciphertext_len = numBytes - MESHTASTIC_PKC_OVERHEAD;
 
-    // Calculate the shared secret with the sending node and decrypt
     if (!crypto->setDHPublicKey(remotePublic.bytes)) {
         return false;
     }
     crypto->hash(shared_key, 32);
-
     initNonce(fromNode, packetNum, extraNonce);
-    printBytes("Attempt decrypt with nonce: ", nonce, 13);
-    printBytes("Attempt decrypt with shared_key starting with: ", shared_key, 8);
-    return aes_ccm_ad(shared_key, 32, nonce, 8, bytes, numBytes - 12, nullptr, 0, auth, bytesOut);
+
+    bool ok = aes_ccm_ad(shared_key, 32, nonce, 8, bytes, ciphertext_len, nullptr, 0, auth, bytesOut);
+    if (!ok) {
+        LOG_WARN("PKC decrypt attempted but failed!");
+        return false;
+    }
+    return true;
 #endif
 }
+
 
 void CryptoEngine::setDHPrivateKey(uint8_t *_private_key)
 {

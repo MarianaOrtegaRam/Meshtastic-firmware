@@ -316,24 +316,101 @@ void CryptoEngine::setKey(const CryptoKey &k)
 /**
  * Encrypt a packet
  *
- * @param bytes is updated in place
+ * Returns ciphertext length (ctlen) written into bytes, or 0 on failure.
  */
-void CryptoEngine::encryptPacket(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes)
+size_t CryptoEngine::encryptPacket(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes)
 {
-    if (key.length > 0) {
-        initNonce(fromNode, packetId);
-        if (numBytes <= MAX_BLOCKSIZE) {
-            encryptAESCtr(key, nonce, numBytes, bytes);
-        } else {
-            LOG_ERROR("Packet too large for crypto engine: %d. noop encryption!", numBytes);
-        }
+    // If no symmetric key set, do nothing -> return original length (cleartext)
+    if (key.length <= 0) {
+        return numBytes;
     }
+
+    // Initialize nonce for this packet (same semantics as before)
+    initNonce(fromNode, packetId);
+
+#ifdef ENABLE_ASCON
+    // Use ASCON AEAD for channel encryption (no AES fallback)
+    // Derive 16-byte ASCON key from channel key (truncate/pad)
+    uint8_t ascon_key[ASCON_KEYLEN] = {0};
+    if (key.length >= ASCON_KEYLEN) {
+        memcpy(ascon_key, key.bytes, ASCON_KEYLEN);
+    } else {
+        memcpy(ascon_key, key.bytes, key.length);
+    }
+
+    // We will write ciphertext (including tag) into bytes (in-place).
+    // The wrapper supports separate buffers; using same buffer works if implementation handles it.
+    size_t ctlen = 0;
+    int rc = ascon_encrypt(ascon_key, nonce, /*ad=*/nullptr, 0, bytes, numBytes, bytes, &ctlen);
+    if (rc != 0) {
+        LOG_WARN("encryptPacket: ASCON encrypt failed (code %d)", rc);
+        return 0;
+    }
+
+    LOG_INFO("encryptPacket: ASCON used: pt=%u -> ct=%u (tag=%u)", (unsigned)numBytes, (unsigned)ctlen, (unsigned)ASCON_TAGLEN);
+    return ctlen;
+#else
+    // If somebody builds without ENABLE_ASCON we keep AES-CTR behavior (but you said you will use ENABLE_ASCON)
+    initNonce(fromNode, packetId);
+    if (numBytes <= MAX_BLOCKSIZE) {
+        encryptAESCtr(key, nonce, numBytes, bytes);
+        return numBytes;
+    } else {
+        LOG_ERROR("Packet too large for crypto engine: %d. noop encryption!", numBytes);
+        return 0;
+    }
+#endif
 }
 
-void CryptoEngine::decrypt(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes)
+/**
+ * Decrypt a packet
+ *
+ * Returns plaintext length (ptlen) written into bytes (0 on failure).
+ */
+size_t CryptoEngine::decrypt(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes)
 {
-    // For CTR, the implementation is the same
-    encryptPacket(fromNode, packetId, numBytes, bytes);
+    // If no symmetric key set, treat input as plaintext
+    if (key.length <= 0) {
+        return numBytes;
+    }
+
+#ifdef ENABLE_ASCON
+    // Ciphertext must at least contain the ASCON tag
+    if (numBytes < ASCON_TAGLEN) {
+        LOG_WARN("decrypt: ASCON ct too small (%zu)", numBytes);
+        return 0;
+    }
+
+    // Derive ASCON key from channel key
+    uint8_t ascon_key[ASCON_KEYLEN] = {0};
+    if (key.length >= ASCON_KEYLEN) {
+        memcpy(ascon_key, key.bytes, ASCON_KEYLEN);
+    } else {
+        memcpy(ascon_key, key.bytes, key.length);
+    }
+
+    // Rebuild nonce for this packet
+    initNonce(fromNode, packetId);
+
+    size_t ptlen = 0;
+    int rc = ascon_decrypt(ascon_key, nonce, /*ad=*/nullptr, 0, bytes, numBytes, bytes, &ptlen);
+    if (rc != 0) {
+        LOG_WARN("decrypt: ASCON decrypt failed (code %d)", rc);
+        return 0;
+    }
+
+    LOG_INFO("decrypt: ASCON used: ct=%u -> pt=%u", (unsigned)numBytes, (unsigned)ptlen);
+    return ptlen;
+#else
+    // AES-CTR fallback (if compiled without ASCON)
+    if (numBytes <= MAX_BLOCKSIZE) {
+        encryptAESCtr(key, nonce, numBytes, bytes);
+        return numBytes;
+    } else {
+        LOG_ERROR("decrypt: Packet too large for crypto engine %d", numBytes);
+        return 0;
+    }
+#endif
 }
 
 // Generic implementation of AES-CTR encryption.

@@ -509,15 +509,22 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                 // we have to copy into a scratch buffer, because these bytes are a union with the decoded protobuf. Create a
                 // fresh copy for each decrypt attempt.
                 memcpy(bytes, p->encrypted.bytes, rawSize);
-                // Try to decrypt the packet if we can
-                crypto->decrypt(p->from, p->id, rawSize, bytes);
 
-                // printBytes("plaintext", bytes, p->encrypted.size);
+                // ---- CHANGED: use decrypt() return length instead of assuming same length ----
+                // Call crypto->decrypt which now returns plaintext length (0 on failure).
+                size_t ptlen = crypto->decrypt(p->from, p->id, rawSize, bytes);
+                if (ptlen == 0) {
+                    // Decrypt failed for this channel; try next channel
+                    LOG_WARN("Channel decrypt failed for channel index %d (hash 0x%x)", chIndex, p->channel);
+                    continue;
+                }
+
+                // printBytes("plaintext", bytes, ptlen);
 
                 // Take those raw bytes and convert them back into a well structured protobuf we can understand
                 meshtastic_Data decodedtmp;
                 memset(&decodedtmp, 0, sizeof(decodedtmp));
-                if (!pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp)) {
+                if (!pb_decode_from_bytes(bytes, ptlen, &meshtastic_Data_msg, &decodedtmp)) {
                     LOG_ERROR("Invalid protobufs in received mesh packet id=0x%08x (bad psk?)!", p->id);
                 } else if (decodedtmp.portnum == meshtastic_PortNum_UNKNOWN_APP) {
                     LOG_ERROR("Invalid portnum (bad psk?)!");
@@ -536,26 +543,31 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
     if (!decrypted && p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP) {
         if (channels.setDefaultPresetCryptoForHash(p->channel)) {
             memcpy(bytes, p->encrypted.bytes, rawSize);
-            crypto->decrypt(p->from, p->id, rawSize, bytes);
 
-            meshtastic_Data decodedtmp;
-            memset(&decodedtmp, 0, sizeof(decodedtmp));
-            if (pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp) &&
-                decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
-                p->decoded = decodedtmp;
-                p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-                // Map to our local default channel index (name+PSK default), not necessarily primary
-                ChannelIndex defaultIndex = channels.getPrimaryIndex();
-                for (ChannelIndex i = 0; i < channels.getNumChannels(); ++i) {
-                    if (channels.isDefaultChannel(i)) {
-                        defaultIndex = i;
-                        break;
-                    }
-                }
-                chIndex = defaultIndex;
-                decrypted = true;
+            // ---- CHANGED: use decrypt() return length here as well ----
+            size_t ptlen = crypto->decrypt(p->from, p->id, rawSize, bytes);
+            if (ptlen == 0) {
+                LOG_WARN("UDP fallback decrypt failed for hash 0x%x", p->channel);
             } else {
-                LOG_WARN("UDP fallback decode attempted but failed for hash 0x%x", p->channel);
+                meshtastic_Data decodedtmp;
+                memset(&decodedtmp, 0, sizeof(decodedtmp));
+                if (pb_decode_from_bytes(bytes, ptlen, &meshtastic_Data_msg, &decodedtmp) &&
+                    decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
+                    p->decoded = decodedtmp;
+                    p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+                    // Map to our local default channel index (name+PSK default), not necessarily primary
+                    ChannelIndex defaultIndex = channels.getPrimaryIndex();
+                    for (ChannelIndex i = 0; i < channels.getNumChannels(); ++i) {
+                        if (channels.isDefaultChannel(i)) {
+                            defaultIndex = i;
+                            break;
+                        }
+                    }
+                    chIndex = defaultIndex;
+                    decrypted = true;
+                } else {
+                    LOG_WARN("UDP fallback decode attempted but failed for hash 0x%x", p->channel);
+                }
             }
         }
     }
@@ -720,8 +732,17 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
                 // No suitable channel could be found for
                 return meshtastic_Routing_Error_NO_CHANNEL;
             }
-            crypto->encryptPacket(getFrom(p), p->id, numbytes, bytes);
-            memcpy(p->encrypted.bytes, bytes, numbytes);
+
+            // ---- CHANGED: encryptPacket now returns ciphertext length ----
+            size_t out_len = crypto->encryptPacket(getFrom(p), p->id, numbytes, bytes);
+            if (out_len == 0) {
+                LOG_ERROR("perhapsEncode: channel encryption failed");
+                return meshtastic_Routing_Error_PKI_FAILED;
+            }
+            // Copy back ciphertext of length out_len
+            memcpy(p->encrypted.bytes, bytes, out_len);
+            // Update numbytes to the actual on-wire length produced by encryptPacket
+            numbytes = out_len;
         }
 #else
         if (p->pki_encrypted == true) {
@@ -736,8 +757,15 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
             // No suitable channel could be found for
             return meshtastic_Routing_Error_NO_CHANNEL;
         }
-        crypto->encryptPacket(getFrom(p), p->id, numbytes, bytes);
-        memcpy(p->encrypted.bytes, bytes, numbytes);
+
+        // ---- CHANGED: encryptPacket now returns ciphertext length ----
+        size_t out_len = crypto->encryptPacket(getFrom(p), p->id, numbytes, bytes);
+        if (out_len == 0) {
+            LOG_ERROR("perhapsEncode: channel encryption failed");
+            return meshtastic_Routing_Error_PKI_FAILED;
+        }
+        memcpy(p->encrypted.bytes, bytes, out_len);
+        numbytes = out_len;
 #endif
 
         // Copy back into the packet and set the variant type

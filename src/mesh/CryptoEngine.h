@@ -64,13 +64,14 @@ class CryptoEngine
      */
     virtual void setKey(const CryptoKey &k);
 
-    /**
+        /**
      * Encrypt a packet
      *
      * @param bytes is updated in place
+     * @return number of bytes of ciphertext written to bytes (0 on failure)
      */
-    virtual void encryptPacket(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes);
-    virtual void decrypt(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes);
+    virtual size_t encryptPacket(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes);
+    virtual size_t decrypt(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes);
     virtual void encryptAESCtr(CryptoKey key, uint8_t *nonce, size_t numBytes, uint8_t *bytes);
 #ifndef PIO_UNIT_TESTING
   protected:

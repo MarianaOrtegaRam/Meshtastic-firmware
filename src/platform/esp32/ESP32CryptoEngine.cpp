@@ -38,4 +38,8 @@ class ESP32CryptoEngine : public CryptoEngine
     }
 };
 
+// al final del archivo:
+#ifndef USE_ASCON_ENGINE
 CryptoEngine *crypto = new ESP32CryptoEngine();
+#endif
+

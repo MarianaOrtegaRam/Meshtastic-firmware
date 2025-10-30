@@ -5,21 +5,14 @@
 
 class ESP32CryptoEngine : public CryptoEngine
 {
-
     mbedtls_aes_context aes;
 
   public:
     ESP32CryptoEngine() { mbedtls_aes_init(&aes); }
-
     ~ESP32CryptoEngine() { mbedtls_aes_free(&aes); }
 
-    /**
-     * Encrypt a packet
-     *
-     * @param bytes is updated in place
-     *  TODO: return bool, and handle graciously when something fails
-     */
-    virtual void encryptAESCtr(CryptoKey _key, uint8_t *_nonce, size_t numBytes, uint8_t *bytes) override
+    // AES-CTR nativo (sin cambios)
+    void encryptAESCtr(CryptoKey _key, uint8_t *_nonce, size_t numBytes, uint8_t *bytes) override
     {
         if (_key.length > 0) {
             if (numBytes <= MAX_BLOCKSIZE) {
@@ -28,8 +21,7 @@ class ESP32CryptoEngine : public CryptoEngine
                 uint8_t stream_block[16];
                 size_t nc_off = 0;
                 memcpy(scratch, bytes, numBytes);
-                memset(scratch + numBytes, 0,
-                       sizeof(scratch) - numBytes); // Fill rest of buffer with zero (in case cypher looks at it)
+                memset(scratch + numBytes, 0, sizeof(scratch) - numBytes);
                 mbedtls_aes_crypt_ctr(&aes, numBytes, &nc_off, _nonce, stream_block, scratch, bytes);
             } else {
                 LOG_ERROR("Packet too large for crypto engine: %d. noop encryption!", numBytes);
@@ -38,8 +30,7 @@ class ESP32CryptoEngine : public CryptoEngine
     }
 };
 
-// al final del archivo:
+// Solo instanciamos el motor AES cuando **NO** estamos usando ASCON
 #ifndef USE_ASCON_ENGINE
 CryptoEngine *crypto = new ESP32CryptoEngine();
 #endif
-

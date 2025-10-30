@@ -644,6 +644,11 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
                          *node->user.public_key.bytes);
                 return meshtastic_Routing_Error_PKI_FAILED;
             }
+            // ---- ASCON flag: PKI ⇒ NO usar ASCON ----
+            crypto->setUseAscon(false);
+            LOG_DEBUG("[ASCON] PKI detectado → no usar ASCON");
+            // -------------------------------------------
+
             crypto->encryptCurve25519(p->to, getFrom(p), node->user.public_key, p->id, numbytes, bytes, p->encrypted.bytes);
             numbytes += MESHTASTIC_PKC_OVERHEAD;
             p->channel = 0;
@@ -661,6 +666,11 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
                 // No suitable channel could be found for
                 return meshtastic_Routing_Error_NO_CHANNEL;
             }
+            // ---- ASCON flag: marcar PSK (no PKI) como "usar ASCON" ----
+            crypto->setUseAscon(true);   // PSK ⇒ privado
+            LOG_INFO("[ASCON] Marcando paquete como canal privado (PSK)");
+            // ------------------------------------------------------------
+
             crypto->encryptPacket(getFrom(p), p->id, numbytes, bytes);
             memcpy(p->encrypted.bytes, bytes, numbytes);
         }

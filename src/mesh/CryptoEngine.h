@@ -92,6 +92,15 @@ class CryptoEngine
      * a 32 bit block counter (starts at zero)
      */
     void initNonce(uint32_t fromNode, uint64_t packetId, uint32_t extraNonce = 0);
+
+  public:
+    /** Flag para indicar si este paquete debe usar ASCON (solo canales privados PSK) */
+    void setUseAscon(bool v) { use_ascon_for_this_packet = v; }
+
+  protected:
+    bool use_ascon_for_this_packet = false;
 };
+
+extern CryptoEngine *crypto;
 
 extern CryptoEngine *crypto;

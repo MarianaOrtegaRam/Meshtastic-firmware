@@ -209,27 +209,26 @@ void CryptoEngine::setKey(const CryptoKey &k)
     LOG_DEBUG("Use AES%d key!", k.length * 8);
     key = k;
 }
-
-/**
- * Encrypt a packet
- *
- * @param bytes is updated in place
- */
-void CryptoEngine::encryptPacket(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes)
+void CryptoEngine::encryptPacket(uint32_t fromNode, uint64_t packetId, size_t &numBytes, uint8_t *bytes)
 {
-    if (key.length > 0) {
-        initNonce(fromNode, packetId);
-        if (numBytes <= MAX_BLOCKSIZE) {
-            encryptAESCtr(key, nonce, numBytes, bytes);
-        } else {
-            LOG_ERROR("Packet too large for crypto engine: %d. noop encryption!", numBytes);
-        }
+    if (key.length <= 0 || !bytes || numBytes == 0) {
+        return; // No key or empty payload → nothing to encrypt
+    }
+
+    initNonce(fromNode, packetId);
+
+    if (numBytes <= MAX_BLOCKSIZE) {
+        // AES-CTR does not change the payload length.
+        encryptAESCtr(key, nonce, numBytes, bytes);
+        // numBytes remains unchanged for CTR mode.
+    } else {
+        LOG_ERROR("Packet too large for crypto engine: %u. noop encryption!", (unsigned)numBytes);
     }
 }
 
-void CryptoEngine::decrypt(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes)
+void CryptoEngine::decrypt(uint32_t fromNode, uint64_t packetId, size_t &numBytes, uint8_t *bytes)
 {
-    // For CTR, the implementation is the same
+    // For AES-CTR, encryption and decryption are symmetric and length is unchanged.
     encryptPacket(fromNode, packetId, numBytes, bytes);
 }
 

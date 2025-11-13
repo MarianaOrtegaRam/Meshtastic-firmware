@@ -65,13 +65,27 @@ class CryptoEngine
     virtual void setKey(const CryptoKey &k);
 
     /**
-     * Encrypt a packet
-     *
-     * @param bytes is updated in place
-     */
-    virtual void encryptPacket(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes);
-    virtual void decrypt(uint32_t fromNode, uint64_t packetId, size_t numBytes, uint8_t *bytes);
-    virtual void encryptAESCtr(CryptoKey key, uint8_t *nonce, size_t numBytes, uint8_t *bytes);
+ * Encrypt a packet.
+ *
+ * @param fromNode  Node ID of the sender (used to build the nonce).
+ * @param packetId  Packet sequence number (used to build the nonce).
+ * @param numBytes  IN:  plaintext length.
+ *                  OUT: ciphertext length (may grow for AEAD modes).
+ * @param bytes     Buffer updated in-place with the encrypted payload.
+ */
+virtual void encryptPacket(uint32_t fromNode, uint64_t packetId, size_t &numBytes, uint8_t *bytes);
+
+/**
+ * Decrypt a packet.
+ *
+ * @param fromNode  Node ID of the sender (used to rebuild the nonce).
+ * @param packetId  Packet sequence number (used to rebuild the nonce).
+ * @param numBytes  IN:  ciphertext length.
+ *                  OUT: plaintext length (may shrink for AEAD modes).
+ * @param bytes     Buffer updated in-place with the decrypted payload.
+ */
+virtual void decrypt(uint32_t fromNode, uint64_t packetId, size_t &numBytes, uint8_t *bytes);
+virtual void encryptAESCtr(CryptoKey key, uint8_t *nonce, size_t numBytes, uint8_t *bytes);
 #ifndef PIO_UNIT_TESTING
   protected:
 #endif

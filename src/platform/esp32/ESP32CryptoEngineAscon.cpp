@@ -82,26 +82,79 @@ public:
                  (unsigned)(cipher_len - plain_len));
     }
 
-    // decrypt(...) lo dejaremos para el siguiente paso (PASO 2),
-    // donde conectaremos ascon_psk_decrypt y ajustaremos rawSize.
+    /**
+     * @brief Decrypt a mesh packet using ASCON-128a AEAD for PSK channels.
+     *
+     * This function is called by Router::perhapsDecode() for channel-based
+     * encryption (PSK). Curve25519 / PKI decryption still uses
+     * CryptoEngine::decryptCurve25519() and is NOT affected.
+     *
+     * Parameters:
+     *  - fromNode: MeshPacket.from field (32-bit node id of sender).
+     *  - packetId: MeshPacket.id field (64-bit packet sequence).
+     *  - numBytes: Number of bytes currently stored in `bytes`.
+     *              For ASCON this is: ciphertext_len = plaintext_len + 16(tag).
+     *  - bytes:    In-place buffer holding ciphertext||tag, will be overwritten
+     *              with the recovered plaintext on successful decryption.
+     *
+     * Lengths:
+     *  - Input : numBytes = clen = mlen + 16.
+     *  - Output: The first (numBytes - 16) bytes of `bytes` contain the
+     *            plaintext. We DO NOT modify `numBytes` here because the
+     *            Router is responsible for stripping the 16-byte tag before
+     *            calling pb_decode_from_bytes().
+     */
     void decrypt(uint32_t fromNode, uint64_t packetId, size_t &numBytes, uint8_t *bytes) override
     {
-        // De momento, mantenemos el comportamiento anterior (placeholder).
-        // En el PASO 2 implementaremos la llamada real a ascon_psk_decrypt(...)
-        // y la gestión de numBytes (cipher_len → plain_len).
-        if (key.length <= 0 || !bytes || numBytes == 0) {
+        // No key / no data => nothing to do (same behavior as base engine).
+        if (key.length <= 0 || bytes == nullptr || numBytes == 0) {
             return;
         }
 
+        // For now we only decrypt PSK channels with ASCON.
+        // PKI traffic uses decryptCurve25519() and never calls this method.
+        // If for some reason this flag is false, we leave the buffer as-is.
         if (!use_ascon_for_this_packet) {
-            LOG_DEBUG("[ASCON] decrypt fallback to AES-CTR engine");
-            CryptoEngine::decrypt(fromNode, packetId, numBytes, bytes);
+            LOG_DEBUG("[ASCON-AEAD] decrypt(): use_ascon_for_this_packet=false → noop");
             return;
         }
 
-        // Placeholder: por ahora solo logueamos que se ha llamado.
-        // En el siguiente paso esto será reemplazado por ASCON-AEAD real.
-        LOG_WARN("[ASCON-AEAD] decrypt() placeholder called. Implementation will be added in PASO 2.");
+        // Build the 13-byte Meshtastic nonce (same as in encryptPacket).
+        initNonce(fromNode, packetId);  // fills `nonce` member in CryptoEngine
+
+        // Ciphertext length (includes 16-byte tag).
+        size_t clen = numBytes;
+
+        // Call the ASCON-128a AEAD wrapper. It will:
+        //  - derive a 16-byte key from the PSK (16/32/short),
+        //  - expand the 13-byte nonce to 16 bytes with SHA-256,
+        //  - verify the tag,
+        //  - and, on success, overwrite `bytes[0..mlen-1]` with plaintext.
+        bool ok = ascon_psk_decrypt(
+            bytes,                 // in-place buffer: ciphertext||tag → plaintext
+            &clen,                 // IN: clen, OUT: mlen = clen - 16
+            key.bytes,             // PSK bytes
+            static_cast<size_t>(key.length),
+            nonce,                 // 13-byte nonce produced by initNonce()
+            sizeof(nonce)          // should be 13
+        );
+
+        if (!ok) {
+            // Authentication failed or inputs invalid: wipe buffer and log.
+            LOG_WARN("[ASCON-AEAD] dec: clen=%u tag_ok=0 → dropping packet",
+                     (unsigned)numBytes);
+            memset(bytes, 0, numBytes);
+            // Router will fail protobuf decoding and treat this as a bad PSK.
+            return;
+        }
+
+        // Successful ASCON-128a decryption.
+        // `clen` now holds mlen (plaintext length), but Router still tracks
+        // the original numBytes. Router::perhapsDecode() will subtract the
+        // 16-byte tag when calling pb_decode_from_bytes().
+        LOG_INFO("[ASCON-AEAD] dec: clen=%u mlen=%u tag_ok=1",
+                 (unsigned)numBytes,
+                 (unsigned)clen);
     }
 };
 

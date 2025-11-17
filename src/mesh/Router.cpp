@@ -469,6 +469,27 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                 // Take those raw bytes and convert them back into a well structured protobuf we can understand
                 meshtastic_Data decodedtmp;
                 memset(&decodedtmp, 0, sizeof(decodedtmp));
+
+                // === ASCON-AEAD: strip 16-byte tag before protobuf decoding =========
+        size_t decodeLen = rawSize;
+
+#ifdef USE_ASCON_ENGINE
+                // When using ASCON-128a AEAD for PSK channels, the last 16 bytes of the
+                // encrypted payload are the authentication tag. After a successful
+                // ascon_psk_decrypt(), the first (rawSize - 16) bytes of `bytes`
+                // contain the plaintext protobuf, and the remaining 16 bytes are
+                // no longer needed.
+                if (decodeLen >= 16) {
+                    decodeLen -= 16;
+                }
+                LOG_DEBUG("[ASCON-AEAD] perhapsDecode: rawSize=%u decodeLen=%u (PSK path)",
+                        (unsigned)rawSize,
+                        (unsigned)decodeLen);
+#endif
+        // =====================================================================
+
+
+
                 if (!pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp)) {
                     LOG_ERROR("Invalid protobufs in received mesh packet id=0x%08x (bad psk?)!", p->id);
                 } else if (decodedtmp.portnum == meshtastic_PortNum_UNKNOWN_APP) {
@@ -492,6 +513,21 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
 
             meshtastic_Data decodedtmp;
             memset(&decodedtmp, 0, sizeof(decodedtmp));
+
+// === ASCON-AEAD: strip 16-byte tag before protobuf decoding =========
+    size_t decodeLen = rawSize;
+#ifdef USE_ASCON_ENGINE
+    if (decodeLen >= 16) {
+        decodeLen -= 16;
+    }
+    LOG_DEBUG("[ASCON-AEAD] perhapsDecode: rawSize=%u decodeLen=%u (UDP fallback)",
+              (unsigned)rawSize,
+              (unsigned)decodeLen);
+#endif
+    // =====================================================================
+
+
+
             if (pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp) &&
                 decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
                 p->decoded = decodedtmp;

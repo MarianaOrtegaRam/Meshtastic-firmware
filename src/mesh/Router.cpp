@@ -409,37 +409,55 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
         return DecodeState::DECODE_FAILURE;
     }
 
+    // If packet was already decoded just return
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag)
-        return DecodeState::DECODE_SUCCESS; // If packet was already decoded just return
+        return DecodeState::DECODE_SUCCESS;
 
     size_t rawSize = p->encrypted.size;
     if (rawSize > sizeof(bytes)) {
         LOG_ERROR("Packet too large to attempt decryption! (rawSize=%d > 256)", rawSize);
         return DecodeState::DECODE_FATAL;
     }
+
     bool decrypted = false;
     ChannelIndex chIndex = 0;
+
 #if !(MESHTASTIC_EXCLUDE_PKI)
-    // Attempt PKI decryption first
-    if (p->channel == 0 && isToUs(p) && p->to > 0 && !isBroadcast(p->to) && nodeDB->getMeshNode(p->from) != nullptr &&
-        nodeDB->getMeshNode(p->from)->user.public_key.size > 0 && nodeDB->getMeshNode(p->to)->user.public_key.size > 0 &&
+    // ---------------------------------------------------------------------
+    // 1) Attempt PKI decryption first (Curve25519 + AES-CCM)
+    //    This path is COMPLETELY independent of ASCON and is not modified.
+    // ---------------------------------------------------------------------
+    if (p->channel == 0 && isToUs(p) && p->to > 0 && !isBroadcast(p->to) &&
+        nodeDB->getMeshNode(p->from) != nullptr &&
+        nodeDB->getMeshNode(p->from)->user.public_key.size > 0 &&
+        nodeDB->getMeshNode(p->to)->user.public_key.size > 0 &&
         rawSize > MESHTASTIC_PKC_OVERHEAD) {
+
         LOG_DEBUG("Attempt PKI decryption");
 
-        if (crypto->decryptCurve25519(p->from, nodeDB->getMeshNode(p->from)->user.public_key, p->id, rawSize, p->encrypted.bytes,
+        if (crypto->decryptCurve25519(p->from,
+                                      nodeDB->getMeshNode(p->from)->user.public_key,
+                                      p->id,
+                                      rawSize,
+                                      p->encrypted.bytes,
                                       bytes)) {
             LOG_INFO("PKI Decryption worked!");
 
             meshtastic_Data decodedtmp;
             memset(&decodedtmp, 0, sizeof(decodedtmp));
+
             rawSize -= MESHTASTIC_PKC_OVERHEAD;
             if (pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp) &&
                 decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
+
                 decrypted = true;
                 LOG_INFO("Packet decrypted using PKI!");
+
                 p->pki_encrypted = true;
-                memcpy(&p->public_key.bytes, nodeDB->getMeshNode(p->from)->user.public_key.bytes, 32);
+                memcpy(&p->public_key.bytes,
+                       nodeDB->getMeshNode(p->from)->user.public_key.bytes, 32);
                 p->public_key.size = 32;
+
                 p->decoded = decodedtmp;
                 p->which_payload_variant = meshtastic_MeshPacket_decoded_tag; // change type to decoded
             } else {
@@ -450,47 +468,62 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
             LOG_WARN("PKC decrypt attempted but failed!");
         }
     }
-#endif
+#endif // !(MESHTASTIC_EXCLUDE_PKI)
 
-    // assert(p->which_payloadVariant == MeshPacket_encrypted_tag);
+    // ---------------------------------------------------------------------
+    // 2) PSK channels (standard Meshtastic channels)
+    //    With USE_ASCON_ENGINE enabled, the CryptoEngine may use:
+    //      - AES-CTR  (legacy path)  → rawSize == plaintext_len
+    //      - ASCON-128a AEAD (PSK)   → rawSize == plaintext_len + 16(tag)
+    // ---------------------------------------------------------------------
     if (!decrypted) {
         // Try to find a channel that works with this hash
         for (chIndex = 0; chIndex < channels.getNumChannels(); chIndex++) {
             // Try to use this hash/channel pair
             if (channels.decryptForHash(chIndex, p->channel)) {
-                // we have to copy into a scratch buffer, because these bytes are a union with the decoded protobuf. Create a
-                // fresh copy for each decrypt attempt.
+                // We have to copy into a scratch buffer, because these bytes are a
+                // union with the decoded protobuf. Create a fresh copy for each
+                // decrypt attempt.
                 memcpy(bytes, p->encrypted.bytes, rawSize);
-                // Try to decrypt the packet if we can
+
+                // Try to decrypt the packet if we can.
+                //  - AES-CTR: length does not change.
+                //  - ASCON-128a AEAD: bytes[] becomes plaintext, but rawSize
+                //    (ciphertext_len) still includes the 16-byte authentication tag.
                 crypto->decrypt(p->from, p->id, rawSize, bytes);
 
                 // printBytes("plaintext", bytes, p->encrypted.size);
 
-                // Take those raw bytes and convert them back into a well structured protobuf we can understand
+                // Take those raw bytes and convert them back into a well structured
+                // protobuf we can understand.
                 meshtastic_Data decodedtmp;
                 memset(&decodedtmp, 0, sizeof(decodedtmp));
 
-                // === ASCON-AEAD: strip 16-byte tag before protobuf decoding =========
-        size_t decodeLen = rawSize;
+                // -----------------------------------------------------------------
+                // ASCON-AEAD length adjustment:
+                //
+                // For ASCON-128a AEAD on PSK channels, the encrypted payload layout is:
+                //    ciphertext_len = plaintext_len + 16(tag)
+                // After a successful ascon_psk_decrypt():
+                //    - bytes[0 .. plaintext_len-1]    = protobuf plaintext
+                //    - the remaining 16 bytes are leftover tag space and can be ignored
+                //
+                // Therefore we must pass ONLY plaintext_len bytes to nanopb.
+                // AES-CTR builds will simply decode the full rawSize as before.
+                // -----------------------------------------------------------------
+                size_t decodeLen = rawSize;
 
 #ifdef USE_ASCON_ENGINE
-                // When using ASCON-128a AEAD for PSK channels, the last 16 bytes of the
-                // encrypted payload are the authentication tag. After a successful
-                // ascon_psk_decrypt(), the first (rawSize - 16) bytes of `bytes`
-                // contain the plaintext protobuf, and the remaining 16 bytes are
-                // no longer needed.
                 if (decodeLen >= 16) {
                     decodeLen -= 16;
                 }
                 LOG_DEBUG("[ASCON-AEAD] perhapsDecode: rawSize=%u decodeLen=%u (PSK path)",
-                        (unsigned)rawSize,
-                        (unsigned)decodeLen);
-#endif
-        // =====================================================================
+                          (unsigned)rawSize,
+                          (unsigned)decodeLen);
+#endif // USE_ASCON_ENGINE
 
-
-
-                if (!pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp)) {
+                if (!pb_decode_from_bytes(bytes, decodeLen,
+                                          &meshtastic_Data_msg, &decodedtmp)) {
                     LOG_ERROR("Invalid protobufs in received mesh packet id=0x%08x (bad psk?)!", p->id);
                 } else if (decodedtmp.portnum == meshtastic_PortNum_UNKNOWN_APP) {
                     LOG_ERROR("Invalid portnum (bad psk?)!");
@@ -505,8 +538,15 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
     }
 
 #if HAS_UDP_MULTICAST
-    // Fallback: for UDP multicast, try default preset names with default PSK if normal channel match failed
-    if (!decrypted && p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP) {
+    // ---------------------------------------------------------------------
+    // 3) Fallback: for UDP multicast, try default preset names with default
+    //    PSK if normal channel match failed. This also may use AES-CTR or
+    //    ASCON-128a AEAD under USE_ASCON_ENGINE.
+    // ---------------------------------------------------------------------
+    if (!decrypted &&
+        p->transport_mechanism ==
+            meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP) {
+
         if (channels.setDefaultPresetCryptoForHash(p->channel)) {
             memcpy(bytes, p->encrypted.bytes, rawSize);
             crypto->decrypt(p->from, p->id, rawSize, bytes);
@@ -514,25 +554,27 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
             meshtastic_Data decodedtmp;
             memset(&decodedtmp, 0, sizeof(decodedtmp));
 
-// === ASCON-AEAD: strip 16-byte tag before protobuf decoding =========
-    size_t decodeLen = rawSize;
+            // Same ASCON-AEAD length adjustment as above, but logged as UDP fallback.
+            size_t decodeLen = rawSize;
+
 #ifdef USE_ASCON_ENGINE
-    if (decodeLen >= 16) {
-        decodeLen -= 16;
-    }
-    LOG_DEBUG("[ASCON-AEAD] perhapsDecode: rawSize=%u decodeLen=%u (UDP fallback)",
-              (unsigned)rawSize,
-              (unsigned)decodeLen);
-#endif
-    // =====================================================================
+            if (decodeLen >= 16) {
+                decodeLen -= 16;
+            }
+            LOG_DEBUG("[ASCON-AEAD] perhapsDecode: rawSize=%u decodeLen=%u (UDP fallback)",
+                      (unsigned)rawSize,
+                      (unsigned)decodeLen);
+#endif // USE_ASCON_ENGINE
 
-
-
-            if (pb_decode_from_bytes(bytes, rawSize, &meshtastic_Data_msg, &decodedtmp) &&
+            if (pb_decode_from_bytes(bytes, decodeLen,
+                                     &meshtastic_Data_msg, &decodedtmp) &&
                 decodedtmp.portnum != meshtastic_PortNum_UNKNOWN_APP) {
+
                 p->decoded = decodedtmp;
                 p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-                // Map to our local default channel index (name+PSK default), not necessarily primary
+
+                // Map to our local default channel index (name+PSK default),
+                // not necessarily primary.
                 ChannelIndex defaultIndex = channels.getPrimaryIndex();
                 for (ChannelIndex i = 0; i < channels.getNumChannels(); ++i) {
                     if (channels.isDefaultChannel(i)) {
@@ -547,7 +589,12 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
             }
         }
     }
-#endif
+#endif // HAS_UDP_MULTICAST
+
+    // ---------------------------------------------------------------------
+    // 4) Final outcome: either successfully decrypted and decoded
+    //    a meshtastic_Data protobuf, or report failure.
+    // ---------------------------------------------------------------------
     if (decrypted) {
         // parsing was successful
         p->channel = chIndex; // change to store the index instead of the hash
@@ -564,13 +611,16 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
 
             memcpy(compressed_in, p->decoded.payload.bytes, p->decoded.payload.size);
 
-            decompressed_len = unishox2_decompress_simple(compressed_in, p->decoded.payload.size, decompressed_out);
+            decompressed_len = unishox2_decompress_simple(compressed_in,
+                                                          p->decoded.payload.size,
+                                                          decompressed_out);
 
             // LOG_DEBUG("**Decompressed length - %d ", decompressed_len);
 
             memcpy(p->decoded.payload.bytes, decompressed_out, decompressed_len);
 
-            // Switch the port from PortNum_TEXT_MESSAGE_COMPRESSED_APP to PortNum_TEXT_MESSAGE_APP
+            // Switch the port from PortNum_TEXT_MESSAGE_COMPRESSED_APP
+            // to PortNum_TEXT_MESSAGE_APP
             p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
         } */
 
@@ -578,7 +628,8 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
 #if ENABLE_JSON_LOGGING
         LOG_TRACE("%s", MeshPacketSerializer::JsonSerialize(p, false).c_str());
 #elif ARCH_PORTDUINO
-        if (portduino_config.traceFilename != "" || portduino_config.logoutputlevel == level_trace) {
+        if (portduino_config.traceFilename != "" ||
+            portduino_config.logoutputlevel == level_trace) {
             LOG_TRACE("%s", MeshPacketSerializer::JsonSerialize(p, false).c_str());
         }
 #endif
@@ -588,6 +639,7 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
         return DecodeState::DECODE_FAILURE;
     }
 }
+
 
 /** Return 0 for success or a Routing_Error code for failure
  */

@@ -35,33 +35,28 @@ extern "C" {
  *
  * Rules:
  *  - 16 bytes  -> copy as is.
- *  - 32 bytes  -> K = SHA-256(PSK32)[0..15].
- *  - otherwise -> pad with zeros to 16 and use those 16 bytes.
+ *  - 0-15 or 16-32 bytes  -> K = SHA-256(PSK32)[0..15].
  */
-static void kdf_psk16(uint8_t out16[16], const uint8_t* psk, size_t psk_len) {
-  if (!psk) { memset(out16, 0, 16); return; }
+static void kdf_psk16(uint8_t out16[16], const uint8_t *psk, size_t psk_len)
+{
+    // Default: all-zero key if PSK is null or empty
+    memset(out16, 0, 16);
 
-  if (psk_len == 16) {
-    memcpy(out16, psk, 16);
-    return;
-  }
+    if (!psk || psk_len == 0) {
+        return;
+    }
 
-  if (psk_len >= 32) {
+    // 1) Exact 16 bytes -> treat as raw 128-bit key (legacy / "expert" mode)
+    if (psk_len == 16) {
+        memcpy(out16, psk, 16);
+        return;
+    }
+
+    // 2) Any other length (shorter or longer) -> hash and truncate
     uint8_t dig[32];
-    mbedtls_sha256(psk, 32, dig, 0);
-    memcpy(out16, dig, 16);
-    return;
-  }
-
-  // "Short" keys: Meshtastic pads with zeros. We mimic that to be consistent.
-  uint8_t tmp[16] = {0};
-  if (psk_len > 0) {
-    size_t n = (psk_len > 16 ? 16 : psk_len);
-    memcpy(tmp, psk, n);
-  }
-  memcpy(out16, tmp, 16);
+    mbedtls_sha256(psk, psk_len, dig, 0);   // 0 = SHA-256, not SHA-224
+    memcpy(out16, dig, 16);                 // take first 128 bits
 }
-
 /**
  * @brief Expand a 13-byte Meshtastic nonce into a 16-byte nonce for ASCON.
  *
